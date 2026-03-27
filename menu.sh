@@ -89,6 +89,7 @@ SSH_SESSION_CACHE_TTL=10
 SSH_SESSION_CACHE_TS=0
 SSH_SESSION_CACHE_DB_MTIME=0
 SSH_SESSION_TOTAL=0
+FF_USERS_GROUP="ffusers"
 declare -A SSH_SESSION_COUNTS=()
 declare -A SSH_SESSION_PIDS=()
 
@@ -116,6 +117,100 @@ ensure_firewallfalcon_dirs() {
     touch "$DB_FILE"
 }
 
+ensure_firewallfalcon_system_group() {
+    getent group "$FF_USERS_GROUP" >/dev/null 2>&1 || groupadd "$FF_USERS_GROUP" >/dev/null 2>&1 || true
+}
+
+db_has_user() {
+    [[ -f "$DB_FILE" ]] || return 1
+    awk -F: -v target="$1" '$1 == target { found=1; exit } END { exit(found ? 0 : 1) }' "$DB_FILE"
+}
+
+is_firewallfalcon_orphan_user() {
+    local username="$1"
+    local passwd_line system_user _ uid _ home shell
+
+    passwd_line=$(getent passwd "$username" 2>/dev/null) || return 1
+    IFS=: read -r system_user _ uid _ _ home shell <<< "$passwd_line"
+    [[ "$uid" =~ ^[0-9]+$ ]] || return 1
+    db_has_user "$username" && return 1
+
+    if id -nG "$username" 2>/dev/null | tr ' ' '\n' | grep -Fxq "$FF_USERS_GROUP"; then
+        return 0
+    fi
+
+    (( uid >= 1000 )) || return 1
+    [[ "$home" == "/home/$username" || "$home" == /home/* ]] || return 1
+
+    case "$shell" in
+        /usr/sbin/nologin|/usr/bin/false|/bin/false) return 0 ;;
+    esac
+
+    return 1
+}
+
+get_firewallfalcon_orphan_users() {
+    local username
+    while IFS=: read -r username _rest; do
+        [[ -n "$username" ]] || continue
+        if is_firewallfalcon_orphan_user "$username"; then
+            echo "$username"
+        fi
+    done < /etc/passwd
+}
+
+get_firewallfalcon_known_users() {
+    local username
+    local -A seen_users=()
+
+    if [[ -f "$DB_FILE" ]]; then
+        while IFS=: read -r username _rest; do
+            [[ -n "$username" && "$username" != \#* ]] || continue
+            seen_users["$username"]=1
+        done < "$DB_FILE"
+    fi
+
+    while IFS= read -r username; do
+        [[ -n "$username" ]] && seen_users["$username"]=1
+    done < <(get_firewallfalcon_orphan_users)
+
+    (( ${#seen_users[@]} > 0 )) || return 0
+    printf "%s\n" "${!seen_users[@]}" | sort
+}
+
+delete_firewallfalcon_user_accounts() {
+    local -a users_to_delete=("$@")
+    local username
+
+    [[ ${#users_to_delete[@]} -gt 0 ]] || return 0
+
+    for username in "${users_to_delete[@]}"; do
+        [[ -n "$username" ]] || continue
+        killall -u "$username" -9 &>/dev/null
+        if id "$username" &>/dev/null; then
+            if userdel -r "$username" &>/dev/null; then
+                echo -e " ✅ System user '${C_YELLOW}$username${C_RESET}' deleted."
+            else
+                echo -e " ❌ Failed to delete system user '${C_YELLOW}$username${C_RESET}'."
+            fi
+        else
+            echo -e " ℹ️ System user '${C_YELLOW}$username${C_RESET}' was already missing. Removing manager data only."
+        fi
+        rm -f "$BANDWIDTH_DIR/${username}.usage"
+        rm -rf "$BANDWIDTH_DIR/pidtrack/${username}"
+    done
+
+    if [[ -f "$DB_FILE" ]]; then
+        local db_tmp
+        db_tmp=$(mktemp)
+        awk -F: 'NR==FNR { drop[$1]=1; next } !($1 in drop)' <(printf "%s\n" "${users_to_delete[@]}") "$DB_FILE" > "$db_tmp" && mv "$db_tmp" "$DB_FILE"
+        rm -f "$db_tmp" 2>/dev/null
+    fi
+
+    invalidate_banner_cache
+    refresh_dynamic_banner_routing_if_enabled
+}
+
 require_interactive_terminal() {
     if [[ ! -t 0 || ! -t 1 ]]; then
         echo -e "${C_RED}❌ Error: The FirewallFalcon menu must be run from an interactive terminal.${C_RESET}"
@@ -128,6 +223,7 @@ initial_setup() {
     check_environment
     
     ensure_firewallfalcon_dirs
+    ensure_firewallfalcon_system_group
     
     echo -e "${C_BLUE}🔹 Configuring user limiter service...${C_RESET}"
     setup_limiter_service
@@ -251,14 +347,29 @@ setup_limiter_service() {
     # Combined limiter + bandwidth monitoring
     cat > "$LIMITER_SCRIPT" << 'EOF'
 #!/bin/bash
-# FirewallFalcon limiter version 2026-03-22.1
+# FirewallFalcon limiter version 2026-03-27.1
 DB_FILE="/etc/firewallfalcon/users.db"
 BW_DIR="/etc/firewallfalcon/bandwidth"
 PID_DIR="$BW_DIR/pidtrack"
+BANNER_DIR="/etc/firewallfalcon/banners"
 SCAN_INTERVAL=30
 
 mkdir -p "$BW_DIR" "$PID_DIR"
 shopt -s nullglob
+
+write_banner_if_changed() {
+    local user="$1"
+    local content="$2"
+    local banner_file="$BANNER_DIR/${user}.txt"
+    local tmp_file="${banner_file}.tmp"
+
+    printf "%s" "$content" > "$tmp_file"
+    if ! cmp -s "$tmp_file" "$banner_file" 2>/dev/null; then
+        mv "$tmp_file" "$banner_file"
+    else
+        rm -f "$tmp_file"
+    fi
+}
 
 while true; do
     if [[ ! -s "$DB_FILE" ]]; then
@@ -267,11 +378,11 @@ while true; do
     fi
 
     current_ts=$(date +%s)
-    declare -A session_counts=()
+    dynamic_banners_enabled=false
     declare -A session_pids=()
     declare -A locked_users=()
     declare -A uid_to_user=()
-    declare -A seen_sessions=()
+    declare -A loginuid_pids=()
 
     while IFS=: read -r username _ uid _rest; do
         [[ -n "$username" && "$uid" =~ ^[0-9]+$ ]] && uid_to_user["$uid"]="$username"
@@ -280,34 +391,56 @@ while true; do
     while read -r ssh_pid ssh_owner; do
         [[ "$ssh_pid" =~ ^[0-9]+$ ]] || continue
 
-        session_user=""
         if [[ -n "$ssh_owner" && "$ssh_owner" != "root" && "$ssh_owner" != "sshd" ]]; then
-            session_user="$ssh_owner"
-        elif [[ -r "/proc/$ssh_pid/loginuid" ]]; then
-            login_uid=""
-            read -r login_uid < "/proc/$ssh_pid/loginuid" || login_uid=""
-            if [[ "$login_uid" =~ ^[0-9]+$ && "$login_uid" != "4294967295" ]]; then
-                session_user="${uid_to_user[$login_uid]}"
-            fi
+            session_pids["$ssh_owner"]+="$ssh_pid "
         fi
-
-        [[ -n "$session_user" ]] || continue
-        session_key="${session_user}:$ssh_pid"
-        [[ -z "${seen_sessions[$session_key]+x}" ]] || continue
-
-        seen_sessions["$session_key"]=1
-        ((session_counts["$session_user"]++))
-        session_pids["$session_user"]+="$ssh_pid "
     done < <(ps -C sshd -o pid=,user= 2>/dev/null)
+
+    for p in /proc/[0-9]*/loginuid; do
+        [[ -f "$p" ]] || continue
+        login_uid=""
+        read -r login_uid < "$p" || login_uid=""
+        [[ "$login_uid" =~ ^[0-9]+$ && "$login_uid" != "4294967295" ]] || continue
+
+        session_user="${uid_to_user[$login_uid]}"
+        [[ -n "$session_user" ]] || continue
+
+        pid_dir=$(dirname "$p")
+        pid_num=$(basename "$pid_dir")
+        comm=""
+        read -r comm < "$pid_dir/comm" || comm=""
+        [[ "$comm" == "sshd" ]] || continue
+
+        ppid_val=""
+        while read -r key value; do
+            if [[ "$key" == "PPid:" ]]; then
+                ppid_val="${value:-}"
+                break
+            fi
+        done < "$pid_dir/status"
+        [[ "$ppid_val" == "1" ]] && continue
+
+        loginuid_pids["$session_user"]+="$pid_num "
+    done
 
     while read -r passwd_user _ passwd_status _rest; do
         [[ "$passwd_status" == "L" ]] && locked_users["$passwd_user"]=1
     done < <(passwd -Sa 2>/dev/null)
 
+    if [[ -f "/etc/firewallfalcon/banners_enabled" ]]; then
+        mkdir -p "$BANNER_DIR"
+        dynamic_banners_enabled=true
+    fi
+
     while IFS=: read -r user pass expiry limit bandwidth_gb _extra; do
         [[ -z "$user" || "$user" == \#* ]] && continue
 
-        online_count=${session_counts["$user"]:-0}
+        declare -A unique_pids=()
+        for pid in ${session_pids["$user"]} ${loginuid_pids["$user"]}; do
+            [[ "$pid" =~ ^[0-9]+$ ]] && unique_pids["$pid"]=1
+        done
+
+        online_count=${#unique_pids[@]}
         user_locked=false
         if [[ -n "${locked_users[$user]+x}" ]]; then
             user_locked=true
@@ -339,6 +472,44 @@ while true; do
             fi
         fi
 
+        if $dynamic_banners_enabled; then
+            days_left="N/A"
+            if [[ "$expiry" != "Never" && -n "$expiry" && "$expiry_ts" =~ ^[0-9]+$ && $expiry_ts -gt 0 ]]; then
+                diff_secs=$((expiry_ts - current_ts))
+                if (( diff_secs <= 0 )); then
+                    days_left="EXPIRED"
+                else
+                    d_l=$(( diff_secs / 86400 ))
+                    h_l=$(( (diff_secs % 86400) / 3600 ))
+                    if (( d_l == 0 )); then
+                        days_left="${h_l}h left"
+                    else
+                        days_left="${d_l}d ${h_l}h"
+                    fi
+                fi
+            fi
+
+            bw_info="Unlimited"
+            if [[ "$bandwidth_gb" != "0" && -n "$bandwidth_gb" ]]; then
+                usagefile="$BW_DIR/${user}.usage"
+                accum_disp=0
+                if [[ -f "$usagefile" ]]; then
+                    read -r accum_disp < "$usagefile"
+                    [[ "$accum_disp" =~ ^[0-9]+$ ]] || accum_disp=0
+                fi
+                used_gb=$(awk "BEGIN {printf \"%.2f\", $accum_disp / 1073741824}")
+                remain_gb=$(awk "BEGIN {r=$bandwidth_gb - $used_gb; if(r<0) r=0; printf \"%.2f\", r}")
+                bw_info="${used_gb}/${bandwidth_gb} GB used | ${remain_gb} GB left"
+            fi
+
+            banner_content="<br><font color=\"yellow\"><b>      ✨ ACCOUNT STATUS ✨      </b></font><br><br>"
+            banner_content+="<font color=\"white\">👤 <b>Username   :</b> $user</font><br>"
+            banner_content+="<font color=\"white\">📅 <b>Expiration :</b> $expiry ($days_left)</font><br>"
+            banner_content+="<font color=\"white\">📊 <b>Bandwidth  :</b> $bw_info</font><br>"
+            banner_content+="<font color=\"white\">🔌 <b>Sessions   :</b> $online_count/$limit</font><br><br>"
+            write_banner_if_changed "$user" "$banner_content"
+        fi
+
         [[ -z "$bandwidth_gb" || "$bandwidth_gb" == "0" ]] && continue
 
         usagefile="$BW_DIR/${user}.usage"
@@ -348,15 +519,13 @@ while true; do
             [[ "$accumulated" =~ ^[0-9]+$ ]] || accumulated=0
         fi
 
-        pids="${session_pids["$user"]}"
-        if [[ -z "$pids" ]]; then
+        if (( ${#unique_pids[@]} == 0 )); then
             rm -f "$PID_DIR/${user}__"*.last 2>/dev/null
             continue
         fi
 
         delta_total=0
-        for pid in $pids; do
-            [[ "$pid" =~ ^[0-9]+$ ]] || continue
+        for pid in "${!unique_pids[@]}"; do
             io_file="/proc/$pid/io"
             cur=0
             if [[ -r "$io_file" ]]; then
@@ -445,11 +614,16 @@ EOF
 }
 
 sync_runtime_components_if_needed() {
-    local limiter_marker="# FirewallFalcon limiter version 2026-03-22.1"
+    local limiter_marker="# FirewallFalcon limiter version 2026-03-27.1"
     if [[ ! -f "$LIMITER_SCRIPT" ]] || ! grep -Fqx "$limiter_marker" "$LIMITER_SCRIPT" 2>/dev/null; then
         setup_limiter_service >/dev/null 2>&1
     fi
-    if [[ -f "$SSHD_FF_CONFIG" || -f "/etc/firewallfalcon/banners_enabled" ]]; then
+    if [[ -f "$BADVPN_SERVICE_FILE" ]]; then
+        ensure_badvpn_service_is_quiet
+    fi
+    if [[ -f "/etc/firewallfalcon/banners_enabled" ]]; then
+        update_ssh_banners_config
+    elif [[ -f "$SSHD_FF_CONFIG" ]]; then
         disable_dynamic_ssh_banner_system
         systemctl reload sshd 2>/dev/null || systemctl reload ssh 2>/dev/null || true
     fi
@@ -500,14 +674,77 @@ disable_dynamic_ssh_banner_system() {
     invalidate_banner_cache
 }
 
+disable_static_ssh_banner_in_sshd_config() {
+    sed -i.bak -E "s|^[[:space:]]*Banner[[:space:]]+$SSH_BANNER_FILE[[:space:]]*$|# Banner $SSH_BANNER_FILE|" /etc/ssh/sshd_config 2>/dev/null
+}
+
+is_static_ssh_banner_enabled() {
+    grep -q -E "^[[:space:]]*Banner[[:space:]]+$SSH_BANNER_FILE[[:space:]]*$" /etc/ssh/sshd_config 2>/dev/null && [ -f "$SSH_BANNER_FILE" ]
+}
+
+is_dynamic_ssh_banner_enabled() {
+    [[ -f "/etc/firewallfalcon/banners_enabled" && -f "$SSHD_FF_CONFIG" ]]
+}
+
+get_ssh_banner_mode() {
+    if is_dynamic_ssh_banner_enabled; then
+        echo "dynamic"
+    elif is_static_ssh_banner_enabled; then
+        echo "static"
+    else
+        echo "disabled"
+    fi
+}
+
+refresh_dynamic_banner_routing_if_enabled() {
+    if is_dynamic_ssh_banner_enabled; then
+        update_ssh_banners_config
+    fi
+}
+
 update_ssh_banners_config() {
-    disable_dynamic_ssh_banner_system
+    local tmp_conf
+
+    if [[ ! -f "/etc/firewallfalcon/banners_enabled" ]]; then
+        if [[ -f "$SSHD_FF_CONFIG" ]]; then
+            rm -f "$SSHD_FF_CONFIG" 2>/dev/null
+            systemctl reload sshd 2>/dev/null || systemctl reload ssh 2>/dev/null
+        fi
+        return
+    fi
+
+    ensure_firewallfalcon_dirs
+    tmp_conf="/tmp/ff_banners_new.conf"
+    echo "# FirewallFalcon - Dynamic per-user SSH banners" > "$tmp_conf"
+
+    if [[ -f "$DB_FILE" ]]; then
+        while IFS=: read -r u _rest; do
+            [[ -z "$u" || "$u" == \#* ]] && continue
+            echo "Match User $u" >> "$tmp_conf"
+            echo "    Banner /etc/firewallfalcon/banners/${u}.txt" >> "$tmp_conf"
+        done < "$DB_FILE"
+    fi
+
+    if ! cmp -s "$tmp_conf" "$SSHD_FF_CONFIG" 2>/dev/null; then
+        mv "$tmp_conf" "$SSHD_FF_CONFIG"
+        if ! grep -q "^Include /etc/ssh/sshd_config.d/" /etc/ssh/sshd_config 2>/dev/null; then
+            echo "Include /etc/ssh/sshd_config.d/*.conf" >> /etc/ssh/sshd_config
+        fi
+        systemctl reload sshd 2>/dev/null || systemctl reload ssh 2>/dev/null
+    else
+        rm -f "$tmp_conf"
+    fi
 }
 
 setup_ssh_login_info() {
-    echo -e "${C_YELLOW}⚠️ Dynamic per-user SSH banners have been removed.${C_RESET}"
-    echo -e "${C_CYAN}Use the Static SSH Banner menu to paste a custom banner instead.${C_RESET}"
-    return 1
+    ensure_firewallfalcon_dirs || return 1
+    if ! touch "/etc/firewallfalcon/banners_enabled"; then
+        echo -e "${C_RED}❌ Failed to enable dynamic SSH banners.${C_RESET}"
+        return 1
+    fi
+    disable_static_ssh_banner_in_sshd_config
+    update_ssh_banners_config
+    return 0
 }
 
 
@@ -683,17 +920,41 @@ _select_user_interface() {
 
 _select_multi_user_interface() {
     local title="$1"
+    local include_orphan_users="${2:-false}"
     clear; show_banner
     echo -e "${C_BOLD}${C_PURPLE}${title}${C_RESET}\n"
     SELECTED_USERS=()
-    if [[ ! -s $DB_FILE ]]; then
-        echo -e "${C_YELLOW}ℹ️ No users found in the database.${C_RESET}"
+    local -a all_users=()
+    local -a orphan_users=()
+    local -A all_user_lookup=()
+    local -A orphan_user_lookup=()
+    local username
+
+    if [[ -s $DB_FILE ]]; then
+        mapfile -t all_users < <(cut -d: -f1 "$DB_FILE" | sort)
+    fi
+
+    if [[ "$include_orphan_users" == "true" ]]; then
+        mapfile -t orphan_users < <(get_firewallfalcon_orphan_users)
+        for username in "${orphan_users[@]}"; do
+            orphan_user_lookup["$username"]=1
+            if ! printf "%s\n" "${all_users[@]}" | grep -Fxq "$username"; then
+                all_users+=("$username")
+            fi
+        done
+        if [[ ${#all_users[@]} -gt 0 ]]; then
+            mapfile -t all_users < <(printf "%s\n" "${all_users[@]}" | sort)
+        fi
+    fi
+
+    if [[ ${#all_users[@]} -eq 0 ]]; then
+        echo -e "${C_YELLOW}ℹ️ No users found in the manager database.${C_RESET}"
+        if [[ "$include_orphan_users" == "true" ]]; then
+            echo -e "${C_DIM}No orphan FirewallFalcon system users were found either.${C_RESET}"
+        fi
         SELECTED_USERS=("NO_USERS"); return
     fi
-    
-    mapfile -t all_users < <(cut -d: -f1 "$DB_FILE" | sort)
-    local -A all_user_lookup=()
-    local username
+
     for username in "${all_users[@]}"; do
         all_user_lookup["$username"]=1
     done
@@ -715,12 +976,19 @@ _select_multi_user_interface() {
     fi
     echo -e "\nPlease select users:\n"
     for i in "${!users[@]}"; do
-        printf "  ${C_GREEN}[%2d]${C_RESET} %s\n" "$((i+1))" "${users[$i]}"
+        local display_user="${users[$i]}"
+        if [[ "$include_orphan_users" == "true" && -n "${orphan_user_lookup[${users[$i]}]+x}" ]]; then
+            display_user="${display_user} ${C_DIM}(system-only)${C_RESET}"
+        fi
+        printf "  ${C_GREEN}[%2d]${C_RESET} %s\n" "$((i+1))" "$display_user"
     done
     echo -e "\n  ${C_GREEN}[all]${C_RESET} Select ALL listed users"
     echo -e "  ${C_RED}  [0]${C_RESET} ↩️ Cancel and return to main menu"
     echo -e "\n${C_CYAN}💡 You can select multiple by number, range, or exact username.${C_RESET}"
     echo -e "${C_CYAN}   Examples: '1 3 5' or '1,3' or '1-4' or 'alice bob'${C_RESET}"
+    if [[ "$include_orphan_users" == "true" ]]; then
+        echo -e "${C_CYAN}   Users marked '(system-only)' are old accounts still on the VPS but missing from users.db${C_RESET}"
+    fi
     echo
     local choice
     while true; do
@@ -814,6 +1082,7 @@ create_user() {
     clear; show_banner
     echo -e "${C_BOLD}${C_PURPLE}--- ✨ Create New SSH User ---${C_RESET}"
     read -p "👉 Enter username (or '0' to cancel): " username
+    local adopt_existing=false
     if [[ "$username" == "0" ]]; then
         echo -e "\n${C_YELLOW}❌ User creation cancelled.${C_RESET}"
         return
@@ -822,8 +1091,25 @@ create_user() {
         echo -e "\n${C_RED}❌ Error: Username cannot be empty.${C_RESET}"
         return
     fi
-    if id "$username" &>/dev/null || grep -q "^$username:" "$DB_FILE"; then
-        echo -e "\n${C_RED}❌ Error: User '$username' already exists.${C_RESET}"; return
+    if db_has_user "$username"; then
+        echo -e "\n${C_RED}❌ Error: User '$username' already exists in FirewallFalcon.${C_RESET}"
+        return
+    fi
+    if id "$username" &>/dev/null; then
+        if is_firewallfalcon_orphan_user "$username"; then
+            echo -e "\n${C_YELLOW}⚠️ User '$username' already exists on the system but is missing from users.db.${C_RESET}"
+            echo -e "${C_DIM}This usually happens after uninstalling the script without deleting the SSH users.${C_RESET}"
+            read -p "👉 Do you want to take control of this existing user and manage it with FirewallFalcon? (y/n): " adopt_confirm
+            if [[ "$adopt_confirm" == "y" || "$adopt_confirm" == "Y" ]]; then
+                adopt_existing=true
+            else
+                echo -e "\n${C_YELLOW}❌ User creation cancelled.${C_RESET}"
+                return
+            fi
+        else
+            echo -e "\n${C_RED}❌ Error: System user '$username' already exists and does not look like a FirewallFalcon SSH account.${C_RESET}"
+            return
+        fi
     fi
     local password=""
     while true; do
@@ -847,8 +1133,13 @@ create_user() {
     if ! [[ "$bandwidth_gb" =~ ^[0-9]+\.?[0-9]*$ ]]; then echo -e "\n${C_RED}❌ Invalid number.${C_RESET}"; return; fi
     local expire_date
     expire_date=$(date -d "+$days days" +%Y-%m-%d)
-    useradd -m -s /usr/sbin/nologin "$username"
-    usermod -aG ffusers "$username" 2>/dev/null
+    ensure_firewallfalcon_system_group
+    if [[ "$adopt_existing" == "true" ]]; then
+        usermod -s /usr/sbin/nologin "$username" &>/dev/null
+    else
+        useradd -m -s /usr/sbin/nologin "$username"
+    fi
+    usermod -aG "$FF_USERS_GROUP" "$username" 2>/dev/null
     echo "$username:$password" | chpasswd; chage -E "$expire_date" "$username"
     echo "$username:$password:$expire_date:$limit:$bandwidth_gb" >> "$DB_FILE"
     
@@ -856,7 +1147,11 @@ create_user() {
     if [[ "$bandwidth_gb" != "0" ]]; then bw_display="${bandwidth_gb} GB"; fi
     
     clear; show_banner
-    echo -e "${C_GREEN}✅ User '$username' created successfully!${C_RESET}\n"
+    if [[ "$adopt_existing" == "true" ]]; then
+        echo -e "${C_GREEN}✅ Existing system user '$username' has been imported into FirewallFalcon!${C_RESET}\n"
+    else
+        echo -e "${C_GREEN}✅ User '$username' created successfully!${C_RESET}\n"
+    fi
     echo -e "  - 👤 Username:          ${C_YELLOW}$username${C_RESET}"
     echo -e "  - 🔑 Password:          ${C_YELLOW}$password${C_RESET}"
     echo -e "  - 🗓️ Expires on:        ${C_YELLOW}$expire_date${C_RESET}"
@@ -872,10 +1167,11 @@ create_user() {
     fi
     
     invalidate_banner_cache
+    refresh_dynamic_banner_routing_if_enabled
 }
 
 delete_user() {
-    _select_multi_user_interface "--- 🗑️ Delete Users (from DB) ---"
+    _select_multi_user_interface "--- 🗑️ Delete FirewallFalcon Users ---" "true"
     if [[ ${#SELECTED_USERS[@]} -eq 0 || "${SELECTED_USERS[0]}" == "NO_USERS" ]]; then return; fi
     
     echo -e "\n${C_RED}⚠️ You selected ${#SELECTED_USERS[@]} user(s) to delete: ${C_YELLOW}${SELECTED_USERS[*]}${C_RESET}"
@@ -883,30 +1179,7 @@ delete_user() {
     if [[ "$confirm" != "y" ]]; then echo -e "\n${C_YELLOW}❌ Deletion cancelled.${C_RESET}"; return; fi
     
     echo -e "\n${C_BLUE}🗑️ Deleting selected users...${C_RESET}"
-    local username
-    for username in "${SELECTED_USERS[@]}"; do
-        killall -u "$username" -9 &>/dev/null
-        if id "$username" &>/dev/null; then
-            if userdel -r "$username" &>/dev/null; then
-                echo -e " ✅ System user '${C_YELLOW}$username${C_RESET}' deleted."
-            else
-                echo -e " ❌ Failed to delete system user '${C_YELLOW}$username${C_RESET}'."
-            fi
-        else
-            echo -e " ℹ️ System user '${C_YELLOW}$username${C_RESET}' was already missing. Removing manager data only."
-        fi
-        rm -f "$BANDWIDTH_DIR/${username}.usage"
-        rm -rf "$BANDWIDTH_DIR/pidtrack/${username}"
-    done
-
-    if [[ -f "$DB_FILE" ]]; then
-        local db_tmp
-        db_tmp=$(mktemp)
-        awk -F: 'NR==FNR { drop[$1]=1; next } !($1 in drop)' <(printf "%s\n" "${SELECTED_USERS[@]}") "$DB_FILE" > "$db_tmp" && mv "$db_tmp" "$DB_FILE"
-        rm -f "$db_tmp" 2>/dev/null
-    fi
-    
-    invalidate_banner_cache
+    delete_firewallfalcon_user_accounts "${SELECTED_USERS[@]}"
 }
 
 edit_user() {
@@ -1173,6 +1446,7 @@ cleanup_expired() {
         done
         echo -e "\n${C_GREEN}✅ Expired users have been cleaned up.${C_RESET}"
         invalidate_banner_cache
+        refresh_dynamic_banner_routing_if_enabled
     else
         echo -e "\n${C_YELLOW}❌ Cleanup cancelled.${C_RESET}"
     fi
@@ -1245,14 +1519,15 @@ restore_user_data() {
     fi
     
     echo -e "${C_BLUE}⚙️ Re-synchronizing system accounts with the restored database...${C_RESET}"
+    ensure_firewallfalcon_system_group
     
     while IFS=: read -r user pass expiry limit; do
         echo "Processing user: ${C_YELLOW}$user${C_RESET}"
         if ! id "$user" &>/dev/null; then
             echo " - User does not exist in system. Creating..."
             useradd -m -s /usr/sbin/nologin "$user"
-            usermod -aG ffusers "$user" 2>/dev/null
         fi
+        usermod -aG "$FF_USERS_GROUP" "$user" 2>/dev/null
         echo " - Setting password..."
         echo "$user:$pass" | chpasswd
         echo " - Setting expiration to $expiry..."
@@ -1263,6 +1538,7 @@ restore_user_data() {
     echo -e "\n${C_GREEN}✅ SUCCESS: User data restore completed.${C_RESET}"
     
     invalidate_banner_cache
+    refresh_dynamic_banner_routing_if_enabled
 }
 
 _enable_banner_in_sshd_config() {
@@ -1326,8 +1602,8 @@ view_ssh_banner() {
 
 remove_ssh_banner() {
     clear; show_banner
-    echo -e "${C_BOLD}${C_PURPLE}--- 🗑️ Remove SSH Banner ---${C_RESET}"
-    read -p "👉 Are you sure you want to disable and remove the SSH banner? (y/n): " confirm
+    echo -e "${C_BOLD}${C_PURPLE}--- 🗑️ Disable SSH Banners ---${C_RESET}"
+    read -p "👉 Are you sure you want to disable all SSH banners? (y/n): " confirm
     if [[ "$confirm" != "y" ]]; then
         echo -e "\n${C_YELLOW}❌ Action cancelled.${C_RESET}"
         echo -e "\nPress ${C_YELLOW}[Enter]${C_RESET} to return..." && read -r
@@ -1341,10 +1617,41 @@ remove_ssh_banner() {
     fi
     disable_dynamic_ssh_banner_system
     echo -e "\n${C_BLUE}⚙️ Disabling banner in sshd_config...${C_RESET}"
-    sed -i.bak -E "s/^( *Banner\s+$SSH_BANNER_FILE)/#\1/" /etc/ssh/sshd_config
+    disable_static_ssh_banner_in_sshd_config
     echo -e "${C_GREEN}✅ Banner disabled in configuration.${C_RESET}"
     _restart_ssh
     echo -e "\nPress ${C_YELLOW}[Enter]${C_RESET} to return..." && read -r
+}
+
+preview_dynamic_ssh_banner() {
+    if ! is_dynamic_ssh_banner_enabled; then
+        echo -e "\n${C_RED}❌ Dynamic banners are not enabled right now.${C_RESET}"
+        press_enter
+        return
+    fi
+
+    echo -e "${C_DIM}Refreshing dynamic banner worker...${C_RESET}"
+    setup_limiter_service >/dev/null 2>&1
+    _select_user_interface "--- 📝 Preview Dynamic Banner ---"
+    local u=$SELECTED_USER
+    if [[ -z "$u" || "$u" == "NO_USERS" ]]; then
+        return
+    fi
+
+    echo -e "\n${C_CYAN}--- Dynamic Banner Preview for user '$u' ---${C_RESET}\n"
+    if [[ -f "/etc/firewallfalcon/banners/${u}.txt" ]]; then
+        cat "/etc/firewallfalcon/banners/${u}.txt"
+    else
+        echo -e "${C_RED}Banner file not generated yet. Waiting up to 10s for the worker...${C_RESET}"
+        sleep 5
+        if ! cat "/etc/firewallfalcon/banners/${u}.txt" 2>/dev/null; then
+            echo -e "\n${C_RED}Still not generated. Here are the last limiter logs:${C_RESET}"
+            echo -e "----------------------------------------------------------------------"
+            journalctl -u firewallfalcon-limiter -n 15 --no-pager
+            echo -e "----------------------------------------------------------------------"
+        fi
+    fi
+    press_enter
 }
 
 ssh_banner_menu() {
@@ -1475,6 +1782,27 @@ uninstall_udp_custom() {
 }
 
 
+ensure_badvpn_service_is_quiet() {
+    if [[ ! -f "$BADVPN_SERVICE_FILE" ]] || grep -q "^StandardOutput=null$" "$BADVPN_SERVICE_FILE" 2>/dev/null; then
+        return
+    fi
+
+    local tmp_service
+    tmp_service=$(mktemp)
+    awk '
+        /^\[Service\]$/ {
+            print
+            print "StandardOutput=null"
+            print "StandardError=null"
+            next
+        }
+        { print }
+    ' "$BADVPN_SERVICE_FILE" > "$tmp_service" && mv "$tmp_service" "$BADVPN_SERVICE_FILE"
+    rm -f "$tmp_service" 2>/dev/null
+    systemctl daemon-reload
+    systemctl restart badvpn.service >/dev/null 2>&1 || true
+}
+
 install_badvpn() {
     clear; show_banner
     echo -e "${C_BOLD}${C_PURPLE}--- 🚀 Installing badvpn (udpgw) ---${C_RESET}"
@@ -1513,6 +1841,8 @@ ExecStart=$badvpn_binary --listen-addr 0.0.0.0:7300 --max-clients 1000 --max-con
 User=root
 Restart=always
 RestartSec=3
+StandardOutput=null
+StandardError=null
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -3245,8 +3575,24 @@ uninstall_script() {
         echo -e "\n${C_GREEN}✅ Uninstallation cancelled.${C_RESET}"
         return
     fi
+    local -a removable_users=()
+    local remove_users_confirm
+    local remove_users_on_uninstall=false
+    mapfile -t removable_users < <(get_firewallfalcon_known_users)
+    if [[ ${#removable_users[@]} -gt 0 ]]; then
+        echo -e "\n${C_YELLOW}FirewallFalcon SSH users detected on this VPS:${C_RESET} ${removable_users[*]}"
+        read -p "👉 Do you also want to permanently delete these SSH users before uninstalling? (y/n): " remove_users_confirm
+        if [[ "$remove_users_confirm" == "y" || "$remove_users_confirm" == "Y" ]]; then
+            remove_users_on_uninstall=true
+        fi
+    fi
     export UNINSTALL_MODE="silent"
     echo -e "\n${C_BLUE}--- 💥 Starting Uninstallation 💥 ---${C_RESET}"
+    
+    if [[ "$remove_users_on_uninstall" == "true" ]]; then
+        echo -e "\n${C_BLUE}🗑️ Removing FirewallFalcon SSH users before uninstall...${C_RESET}"
+        delete_firewallfalcon_user_accounts "${removable_users[@]}"
+    fi
     
     echo -e "\n${C_BLUE}🗑️ Removing active limiter service...${C_RESET}"
     systemctl stop firewallfalcon-limiter &>/dev/null
@@ -3388,8 +3734,9 @@ create_trial_account() {
     expiry_timestamp=$(date -d "+${duration_hours} hours" '+%Y-%m-%d %H:%M:%S')
     
     # Create the system user
+    ensure_firewallfalcon_system_group
     useradd -m -s /usr/sbin/nologin "$username"
-    usermod -aG ffusers "$username" 2>/dev/null
+    usermod -aG "$FF_USERS_GROUP" "$username" 2>/dev/null
     echo "$username:$password" | chpasswd
     chage -E "$expire_date" "$username"
     echo "$username:$password:$expire_date:$limit:$bandwidth_gb" >> "$DB_FILE"
@@ -3422,6 +3769,7 @@ create_trial_account() {
     fi
     
     invalidate_banner_cache
+    refresh_dynamic_banner_routing_if_enabled
 }
 
 view_user_bandwidth() {
@@ -3508,6 +3856,7 @@ bulk_create_users() {
     local expire_date
     expire_date=$(date -d "+$days days" +%Y-%m-%d)
     local bw_display="Unlimited"; [[ "$bandwidth_gb" != "0" ]] && bw_display="${bandwidth_gb} GB"
+    ensure_firewallfalcon_system_group
     
     echo -e "\n${C_BLUE}⚙️ Creating $count users with prefix '${prefix}'...${C_RESET}\n"
     echo -e "${C_YELLOW}================================================================${C_RESET}"
@@ -3523,7 +3872,7 @@ bulk_create_users() {
         fi
         local password=$(head /dev/urandom | tr -dc 'A-Za-z0-9' | head -c 8)
         useradd -m -s /usr/sbin/nologin "$username"
-        usermod -aG ffusers "$username" 2>/dev/null
+        usermod -aG "$FF_USERS_GROUP" "$username" 2>/dev/null
         echo "$username:$password" | chpasswd
         chage -E "$expire_date" "$username"
         echo "$username:$password:$expire_date:$limit:$bandwidth_gb" >> "$DB_FILE"
@@ -3535,6 +3884,7 @@ bulk_create_users() {
     echo -e "\n${C_GREEN}✅ Created $created users. Conn Limit: ${limit} | BW: ${bw_display}${C_RESET}"
     
     invalidate_banner_cache
+    refresh_dynamic_banner_routing_if_enabled
 }
 
 generate_client_config() {
@@ -3834,18 +4184,22 @@ _flush_torrent_rules() {
 ssh_banner_menu() {
     while true; do
         show_banner
+        local banner_mode
         local banner_status
-        if grep -q -E "^\s*Banner\s+$SSH_BANNER_FILE" /etc/ssh/sshd_config && [ -f "$SSH_BANNER_FILE" ]; then
-            banner_status="${C_STATUS_A}(Active)${C_RESET}"
-        else
-            banner_status="${C_STATUS_I}(Inactive)${C_RESET}"
-        fi
+        banner_mode=$(get_ssh_banner_mode)
+        case "$banner_mode" in
+            dynamic) banner_status="${C_STATUS_A}Dynamic${C_RESET}" ;;
+            static) banner_status="${C_STATUS_A}Static${C_RESET}" ;;
+            *) banner_status="${C_STATUS_I}Disabled${C_RESET}" ;;
+        esac
 
-        echo -e "\n   ${C_TITLE}═════════════════[ ${C_BOLD}🎨 STATIC SSH BANNER ${banner_status} ${C_RESET}${C_TITLE}]═════════════════${C_RESET}"
-        echo -e "${C_DIM}Uses the standard OpenSSH directive: Banner $SSH_BANNER_FILE${C_RESET}"
-        printf "     ${C_CHOICE}[ 1]${C_RESET} %-40s\n" "📋 Paste or Replace Static Banner"
-        printf "     ${C_CHOICE}[ 2]${C_RESET} %-40s\n" "👁️ View Current Banner"
-        printf "     ${C_DANGER}[ 3]${C_RESET} %-40s\n" "🗑️ Disable and Remove Banner"
+        echo -e "\n   ${C_TITLE}═════════════════[ ${C_BOLD}🎨 SSH BANNER MODE: ${banner_status} ${C_RESET}${C_TITLE}]═════════════════${C_RESET}"
+        echo -e "${C_DIM}Static mode uses 'Banner $SSH_BANNER_FILE'. Dynamic mode shows per-user account info.${C_RESET}"
+        printf "     ${C_CHOICE}[ 1]${C_RESET} %-40s\n" "✨ Enable Dynamic Account Banner"
+        printf "     ${C_CHOICE}[ 2]${C_RESET} %-40s\n" "📋 Paste or Replace Static Banner"
+        printf "     ${C_CHOICE}[ 3]${C_RESET} %-40s\n" "👁️ View Current Static Banner"
+        printf "     ${C_CHOICE}[ 4]${C_RESET} %-40s\n" "📝 Preview Dynamic Banner"
+        printf "     ${C_DANGER}[ 5]${C_RESET} %-40s\n" "🗑️ Disable All SSH Banners"
         echo -e "   ${C_DIM}~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~${C_RESET}"
         echo -e "     ${C_WARN}[ 0]${C_RESET} ↩️ Return to Main Menu"
         echo
@@ -3854,9 +4208,17 @@ ssh_banner_menu() {
             return
         fi
         case $choice in
-            1) set_ssh_banner_paste ;;
-            2) view_ssh_banner ;;
-            3) remove_ssh_banner ;;
+            1)
+                if setup_ssh_login_info; then
+                    echo -e "\n${C_GREEN}✅ Dynamic account banner enabled.${C_RESET}"
+                    echo -e "${C_DIM}Users will now see their account info banner instead of the static banner.${C_RESET}"
+                fi
+                press_enter
+                ;;
+            2) set_ssh_banner_paste ;;
+            3) view_ssh_banner ;;
+            4) preview_dynamic_ssh_banner ;;
+            5) remove_ssh_banner ;;
             0) return ;;
             *) echo -e "\n${C_RED}❌ Invalid option.${C_RESET}" && sleep 1 ;;
         esac
@@ -3931,7 +4293,7 @@ main_menu() {
         echo
         echo -e "   ${C_TITLE}══════════════[ ${C_BOLD}⚙️ SYSTEM SETTINGS ${C_RESET}${C_TITLE}]═══════════════${C_RESET}"
         printf "     ${C_CHOICE}[%2s]${C_RESET} %-28s ${C_CHOICE}[%2s]${C_RESET} %-28s\n" "15" "☁️  CloudFlare Free Domain" "18" "💾 Backup User Data"
-        printf "     ${C_CHOICE}[%2s]${C_RESET} %-28s ${C_CHOICE}[%2s]${C_RESET} %-28s\n" "16" "🎨 Static SSH Banner" "19" "📥 Restore User Data"
+        printf "     ${C_CHOICE}[%2s]${C_RESET} %-28s ${C_CHOICE}[%2s]${C_RESET} %-28s\n" "16" "🎨 SSH Banner Config" "19" "📥 Restore User Data"
         printf "     ${C_CHOICE}[%2s]${C_RESET} %-28s ${C_CHOICE}[%2s]${C_RESET} %-28s\n" "17" "🔄 Auto-Reboot Task" "20" "🧹 Cleanup Expired Users"
 
         echo
