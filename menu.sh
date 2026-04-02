@@ -1345,7 +1345,7 @@ list_users() {
         local online_count="${SSH_SESSION_COUNTS[$user]:-0}"
         local connection_string="$online_count / $limit"
         local plain_status="Active"
-        local status="${C_GREEN}🟢 Active${C_RESET}"
+        local status="${C_GREEN}🟢 Act${C_RESET}"
         local quota_exceeded=false
 
         [[ -z "$bandwidth_gb" ]] && bandwidth_gb="0"
