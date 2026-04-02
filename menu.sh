@@ -1409,16 +1409,35 @@ list_users() {
 renew_user() {
     _select_multi_user_interface "--- 🔄 Renew Users ---"
     if [[ ${#SELECTED_USERS[@]} -eq 0 || "${SELECTED_USERS[0]}" == "NO_USERS" ]]; then return; fi
-    read -p "👉 Enter number of days to extend the account(s): " days; if ! [[ "$days" =~ ^[0-9]+$ ]]; then echo -e "\n${C_RED}❌ Invalid number.${C_RESET}"; return; fi
-    local new_expire_date; new_expire_date=$(date -d "+$days days" +%Y-%m-%d)
-    
+    read -p "👉 Enter number of days to extend the account(s): " days
+    if ! [[ "$days" =~ ^[0-9]+$ ]]; then echo -e "\n${C_RED}❌ Invalid number.${C_RESET}"; return; fi
+
+    local today; today=$(date +%Y-%m-%d)
+
     echo -e "\n${C_BLUE}🔄 Renewing selected users for $days days...${C_RESET}"
     for u in "${SELECTED_USERS[@]}"; do
-        chage -E "$new_expire_date" "$u"
-        local line; line=$(grep "^$u:" "$DB_FILE"); local pass; pass=$(echo "$line"|cut -d: -f2); local limit; limit=$(echo "$line"|cut -d: -f4); local bw; bw=$(echo "$line"|cut -d: -f5)
+        local line; line=$(grep "^$u:" "$DB_FILE")
+        local pass; pass=$(echo "$line" | cut -d: -f2)
+        local cur_expire; cur_expire=$(echo "$line" | cut -d: -f3)
+        local limit; limit=$(echo "$line" | cut -d: -f4)
+        local bw; bw=$(echo "$line" | cut -d: -f5)
         [[ -z "$bw" ]] && bw="0"
+
+        # Jeśli konto ważne (data wygaśnięcia >= dzisiaj) → dodaj do istniejącej daty
+        # W przeciwnym razie → dodaj od dzisiaj
+        local base_date
+        if [[ -n "$cur_expire" ]] && [[ "$cur_expire" > "$today" || "$cur_expire" == "$today" ]]; then
+            base_date="$cur_expire"
+        else
+            base_date="$today"
+        fi
+
+        local new_expire_date
+        new_expire_date=$(date -d "$base_date +$days days" +%Y-%m-%d)
+
+        chage -E "$new_expire_date" "$u"
         sed -i "s/^$u:.*/$u:$pass:$new_expire_date:$limit:$bw/" "$DB_FILE"
-        echo -e " ✅ ${C_YELLOW}$u${C_RESET} renewed until ${C_GREEN}${new_expire_date}${C_RESET}."
+        echo -e " ✅ ${C_YELLOW}$u${C_RESET} renewed until ${C_GREEN}${new_expire_date}${C_RESET} (+${days}d from ${base_date})."
     done
 }
 
