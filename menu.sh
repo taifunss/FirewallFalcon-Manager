@@ -410,6 +410,7 @@ while true; do
         comm=""
         read -r comm < "$pid_dir/comm" || comm=""
         [[ "$comm" == "sshd" ]] || continue
+        grep -q "^State:.*Z" "$pid_dir/status" 2>/dev/null && continue
 
         ppid_val=""
         while read -r key value; do
