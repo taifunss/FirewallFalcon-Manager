@@ -5493,33 +5493,32 @@ _warp_cmd() {
 }
 
 _warp_connect_safe() {
-    # warp-cli connect w nowym API blokuje — uruchamiamy w tle z watchem
-    timeout 5 warp-cli connect 2>/dev/null &
-    local bg_pid=$!
-    # Poczekaj max 30s aż status zmieni się na connected
+    # Nowe warp-cli connect BLOKUJE terminal — nie używamy jej wcale.
+    # Zamiast tego: warp-cli mode warp powoduje auto-connect przez warp-svc.
+    # Czekamy aż status zmieni się na Connected.
+    timeout 5 warp-cli mode warp 2>/dev/null || true
     local ok=false
-    for i in {1..15}; do
+    for i in $(seq 1 20); do
         sleep 2
-        if timeout 3 _warp_is_connected; then
+        if timeout 5 warp-cli status 2>/dev/null | grep -qi "Connected"; then
             ok=true; break
         fi
     done
-    # Zabij background connect jeśli jeszcze żyje
-    kill "$bg_pid" 2>/dev/null || true
-    wait "$bg_pid" 2>/dev/null || true
     [[ "$ok" == "true" ]]
 }
 
 _warp_disconnect_safe() {
-    timeout 5 _warp_disconnect_safe
+    # Rozłącz przez mode off — nie blokuje
+    timeout 10 warp-cli mode off 2>/dev/null || true
+    sleep 2
 }
 
 _warp_is_registered() {
-    timeout 5 warp-cli registration show 2>/dev/null         | grep -qiE "id|device|registration" 2>/dev/null
+    timeout 8 warp-cli registration show 2>/dev/null         | grep -qiE "id|device|registration"
 }
 
 _warp_is_connected() {
-    timeout 5 _warp_is_connected
+    timeout 5 warp-cli status 2>/dev/null | grep -qi "Connected"
 }
 
 _warp_get_ip() {
@@ -5833,13 +5832,13 @@ https://pkg.cloudflareclient.com/ ${codename} main" \
 
     # Ustaw tryb WARP + Userspace (NIE kernel WireGuard)
     # Userspace = WARP nie dotyka kernel routing tables
-    _warp_cmd 5 mode warp
+    timeout 8 warp-cli mode warp 2>/dev/null || true
     sleep 1
-    _warp_cmd 5 tunnel protocol Userspace
+    timeout 8 warp-cli tunnel protocol Userspace 2>/dev/null || true
     sleep 1
     
     local proto
-    proto=$(warp-cli tunnel protocol 2>/dev/null || echo "unknown")
+    proto=$(timeout 5 warp-cli tunnel protocol 2>/dev/null || echo "unknown")
     echo -e "  ${C_GREEN}✅ WARP skonfigurowany — protokół: ${proto}${C_RESET}"
 
     # Sprawdź reguły SSH po konfiguracji WARP (przed connect)
@@ -5853,8 +5852,11 @@ https://pkg.cloudflareclient.com/ ${codename} main" \
     # KROK 5: Połącz WARP
     # ip rule priority 50 jest aktywne — SSH jest bezpieczne
     # ════════════════════════════════════════════════════════
-    echo -e "  ${C_BLUE}[5/8] Łączenie WARP...${C_RESET}"
-    _warp_connect_safe && local warp_connected=true || local warp_connected=false
+    echo -e "  ${C_BLUE}[5/8] Łączenie WARP (przez warp-cli mode warp)...${C_RESET}"
+    # NIE używamy warp-cli connect — blokuje terminal w nowym API
+    # warp-cli mode warp powoduje auto-connect przez warp-svc daemon
+    local warp_connected=false
+    _warp_connect_safe && warp_connected=true || true
 
     if [[ "$warp_connected" == "true" ]]; then
         local warp_ip; warp_ip=$(curl -s --max-time 6 https://cloudflare.com/cdn-cgi/trace \
@@ -6045,47 +6047,41 @@ _wgw_install_watchdog() {
 
     cat > /usr/local/bin/warp-watchdog.sh << 'WDEOF'
 #!/bin/bash
-# WARP Watchdog — standalone script, nie używa funkcji menu
+# WARP Watchdog — samodzielny skrypt, czyta konfigurację z warp-env.conf
 LOG="/var/log/warp-watchdog.log"
-
-log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG"; }
-
-# Wczytaj konfigurację zapisaną przy instalacji
 CONF="/etc/wireguard/warp-env.conf"
-[[ -f "$CONF" ]] && source "$CONF"
-[[ -z "$VPS_IP"   ]] && { log "BŁĄD: brak CONF $CONF"; sleep 60; exit 1; }
+
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG"; }
+
+[[ -f "$CONF" ]] || { log "BŁĄD: brak $CONF"; sleep 60; exit 1; }
+source "$CONF"
+[[ -z "$VPS_IP" ]] && { log "BŁĄD: VPS_IP puste"; sleep 60; exit 1; }
 
 # Rotacja logów (max 5MB)
-[[ -f "$LOG" ]] && [[ "$(stat -c%s "$LOG" 2>/dev/null || echo 0)" -gt 5242880 ]] && \
-    mv "$LOG" "${LOG}.1" && touch "$LOG"
+[[ -f "$LOG" ]] && (( $(stat -c%s "$LOG" 2>/dev/null || echo 0) > 5242880 )) &&     mv "$LOG" "${LOG}.1" && touch "$LOG"
 
 log "=== Watchdog start (PID $$) ==="
 
-_wc() {
-    # Bezpieczne wywołanie warp-cli z timeoutem
-    timeout "${1}" warp-cli "${@:2}" 2>/dev/null
-}
-
 _is_connected() {
-    _wc 5 status 2>/dev/null | grep -qi "connected"
+    # NIE używamy warp-cli connect — blokuje.
+    # Status sprawdzamy przez warp-cli status
+    timeout 5 warp-cli status 2>/dev/null | grep -qi "Connected"
 }
 
 _do_connect() {
-    timeout 8 warp-cli connect 2>/dev/null &
-    local pid=$!
+    # Łączymy przez mode warp — auto-connect przez warp-svc daemon
+    timeout 8 warp-cli mode warp 2>/dev/null || true
     local ok=false
-    for i in $(seq 1 12); do
+    for i in $(seq 1 15); do
         sleep 2
         _is_connected && ok=true && break
     done
-    kill "$pid" 2>/dev/null || true
-    wait "$pid" 2>/dev/null || true
     $ok
 }
 
 _do_disconnect() {
-    timeout 6 warp-cli disconnect 2>/dev/null || true
-    sleep 1
+    timeout 8 warp-cli mode off 2>/dev/null || true
+    sleep 2
 }
 
 _repair_ssh() {
@@ -6106,15 +6102,11 @@ _repair_ssh() {
 
 _refresh_wg_route() {
     local warp_if
-    warp_if=$(ip link show 2>/dev/null | grep -oP '^\d+: \K[^:@]+' \
-        | grep -iE 'CloudflareWARP|warp' | head -1)
+    warp_if=$(ip link show 2>/dev/null | grep -oP '^\d+: \K[^:@]+'         | grep -iE 'CloudflareWARP|warp' | head -1)
     if [[ -n "$warp_if" ]] && ip link show "$warp_if" &>/dev/null 2>&1; then
-        ip route replace default dev "$warp_if" table "${RT_TABLE}" 2>/dev/null && \
-            log "Routing WG → WARP ($warp_if)"
+        ip route replace default dev "$warp_if" table "${RT_TABLE}" 2>/dev/null &&             log "Routing WG → WARP ($warp_if)"
     else
-        ip route replace default via "${ORIG_GW}" dev "${WAN_IFACE}" \
-            table "${RT_TABLE}" 2>/dev/null && \
-            log "Routing WG → fallback (${WAN_IFACE})"
+        ip route replace default via "${ORIG_GW}" dev "${WAN_IFACE}"             table "${RT_TABLE}" 2>/dev/null &&             log "Routing WG → fallback (${WAN_IFACE})"
     fi
 }
 
@@ -6123,7 +6115,7 @@ while true; do
     _repair_ssh
 
     if _is_connected; then
-        if [[ $fails -gt 0 ]]; then
+        if (( fails > 0 )); then
             log "WARP ponownie połączony po ${fails} próbach"
             fails=0
             _refresh_wg_route
@@ -6132,7 +6124,7 @@ while true; do
         (( fails++ ))
         log "WARP rozłączony — próba ${fails}"
         if (( fails >= 2 )); then
-            log "Reconnect..."
+            log "Reconnect przez mode warp..."
             _do_disconnect
             if _do_connect; then
                 log "Reconnect OK"
